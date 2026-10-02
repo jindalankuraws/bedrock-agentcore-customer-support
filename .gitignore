@@ -1,0 +1,22 @@
+# Build output of the mock API (the source itself IS tracked)
+mock-telco-api/.aws-sam/
+
+# Local secrets and account-specific state
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Evaluation output (raw service responses; RESULTS.md IS tracked)
+agent/eval/results/
+
+# Third-party PDFs are not ours to redistribute; the demo walkthrough is ours
+*.pdf
+!demo-screenshots.pdf
+
+# macOS
+.DS_Store

@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stage 1d - IAM roles for the agent runtime and the gateway.
+  Deployed after the guardrail and knowledge base so their ARNs can be resolved
+  from SSM and the permissions scoped to those exact resources.
+  Region: ap-southeast-1.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: telco-support
+  SsmPrefix:
+    Type: String
+    Default: /telco-support
+  EcrRepositoryArn:
+    Type: String
+    Description: ECR repository ARN from the foundation stack.
+  MockApiId:
+    Type: String
+    Description: REST API ID of the mock telco backend.
+  MockApiStage:
+    Type: String
+    Default: demo
+  InferenceProfilePrefix:
+    Type: String
+    Default: "apac.amazon.nova-*"
+    Description: >-
+      Inference profiles the runtime may invoke. Narrow by default so the grant
+      matches the model actually in use. Widen to "*" only if the model is reached
+      through a profile with a different prefix.
+
+Resources:
+  # --- Runtime execution role ----------------------------------------------
+  AgentRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-runtime-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: model-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Nova is reached through the APAC cross-region inference profile, which
+              # fans out to the underlying foundation models, so both ARN shapes are needed.
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/amazon.nova-*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${InferenceProfilePrefix}"
+
+        - PolicyName: guardrail
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub "{{resolve:ssm:${SsmPrefix}/guardrail/arn}}"
+
+        - PolicyName: knowledge-base-retrieve
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Scoped to the one knowledge base ARN published by the KB stack.
+              # That stack deploys in this region by default, so this is an
+              # in-region grant; the ARN is read from SSM rather than assumed, so
+              # it stays correct if the tested variant is selected instead.
+              - Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !Sub "{{resolve:ssm:${SsmPrefix}/kb/arn}}"
+
+        - PolicyName: gateway-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+
+        - PolicyName: container-image
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Ref EcrRepositoryArn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken   # does not support resource scoping
+                Resource: "*"
+
+        - PolicyName: observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"                        # X-Ray write APIs are not resource-scopable
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+
+        - PolicyName: workload-identity
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                  - bedrock-agentcore:GetWorkloadAccessTokenForUserId
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default"
+                  - !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/*"
+
+  # --- Gateway role: the only thing it may do is call the mock backend ------
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-gateway-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-mock-api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MockApiId}/${MockApiStage}/*"
+
+  RuntimeRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/iam/runtime-role-arn"
+      Type: String
+      Value: !GetAtt AgentRuntimeRole.Arn
+
+  GatewayRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/iam/gateway-role-arn"
+      Type: String
+      Value: !GetAtt GatewayRole.Arn
+
+Outputs:
+  RuntimeRoleArn:
+    Value: !GetAtt AgentRuntimeRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RuntimeRoleArn"
+  GatewayRoleArn:
+    Value: !GetAtt GatewayRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-GatewayRoleArn"

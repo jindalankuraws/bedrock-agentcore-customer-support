@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stage 1e - AgentCore Gateway and its API Gateway target. Turns the mock telco
+  REST API into MCP tools. Region: ap-southeast-1.
+
+  This is in stage 1, not stage 2, even though the brief listed it later: the
+  runtime needs the gateway URL as an environment variable, and the gateway
+  itself depends only on the mock backend, not on the agent image.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: telco-support
+  SsmPrefix:
+    Type: String
+    Default: /telco-support
+  MockApiId:
+    Type: String
+    Description: REST API ID of the mock telco backend (output of the SAM stack).
+  MockApiStage:
+    Type: String
+    Default: demo
+
+Resources:
+  TelcoGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub "${ProjectName}-gateway"
+      Description: Telco plan, bill, plan-change and ticket tools.
+      RoleArn: !Sub "{{resolve:ssm:${SsmPrefix}/iam/gateway-role-arn}}"
+      # The caller is the agent runtime's IAM role. Production with real end users
+      # would use CUSTOM_JWT so the end user's identity reaches the gateway.
+      AuthorizerType: AWS_IAM
+      ProtocolType: MCP
+      ExceptionLevel: DEBUG
+
+  TelcoApiTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt TelcoGateway.GatewayIdentifier
+      Name: telcoApiGateway
+      Description: Mock telco REST API exposed as MCP tools.
+      # Without this the gateway calls the REST API unsigned and API Gateway
+      # answers 403 "Missing Authentication Token". GATEWAY_IAM_ROLE makes it
+      # sign each call with the gateway role using SigV4 for execute-api.
+      # An ApiGateway target rejects an explicit IamCredentialProvider
+      # ("only MCP Server, OpenAPI and Passthrough targets can configure" one):
+      # the type alone is enough, and execute-api signing is implied.
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          ApiGateway:
+            RestApiId: !Ref MockApiId
+            Stage: !Ref MockApiStage
+            ApiGatewayToolConfiguration:
+              ToolFilters:
+                - FilterPath: "/*"
+                  Methods: [GET, POST]
+              # Tool descriptions are the agent's routing logic, so they are
+              # explicit here rather than inferred from the OpenAPI summary.
+              ToolOverrides:
+                - Name: get_all_plans
+                  Path: /plans
+                  Method: GET
+                  Description: >-
+                    List all mobile plans on offer: plan_id, name, monthly price, data,
+                    talk time and SMS. Takes no inputs.
+                - Name: get_plan
+                  Path: /accounts/{account_id}/plan
+                  Method: GET
+                  Description: >-
+                    Get a customer's current plan and data usage.
+                    account_id: the customer's account ID.
+                - Name: get_bill
+                  Path: /accounts/{account_id}/bills
+                  Method: GET
+                  Description: >-
+                    Get a customer's bill: line items, total, due date and status. Use it for
+                    any question about the bill or a charge; explaining the bill is a complete
+                    answer. account_id: the customer's account ID. month: optional, format
+                    YYYY-MM; omit for the latest bill.
+                - Name: change_plan
+                  Path: /accounts/{account_id}/plan-change
+                  Method: POST
+                  Description: >-
+                    Change a customer's plan. new_plan_id: a plan_id from get_all_plans
+                    (VALUE_50, LITE_150 or MAX_1TB); call get_all_plans first if you don't have
+                    it. Call only after the customer has named the new plan.
+                    account_id: the customer's account ID.
+                - Name: create_ticket
+                  Path: /tickets
+                  Method: POST
+                  Description: >-
+                    Raise a ticket for the customer service team. Use ONLY when the customer
+                    explicitly asks for a fee waiver, refund, dispute, complaint, account change
+                    or a human, OR asks about a charge that is not on their bill (check with
+                    get_bill first). Do NOT use it just to explain a bill.
+                    account_id: the customer's account ID. summary: one sentence.
+                    category: FEE_WAIVER, BILLING_DISPUTE, ACCOUNT_CHANGE, COMPLAINT or OTHER.
+                    priority: HIGH only if the customer is angry or it is urgent, otherwise MEDIUM.
+
+  GatewayUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/gateway/url"
+      Type: String
+      Value: !GetAtt TelcoGateway.GatewayUrl
+      Description: MCP endpoint the agent connects to.
+
+  GatewayArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/gateway/arn"
+      Type: String
+      Value: !GetAtt TelcoGateway.GatewayArn
+
+Outputs:
+  GatewayUrl:
+    Value: !GetAtt TelcoGateway.GatewayUrl
+  GatewayArn:
+    Value: !GetAtt TelcoGateway.GatewayArn
+    Export:
+      Name: !Sub "${AWS::StackName}-GatewayArn"
+  TargetId:
+    Value: !GetAtt TelcoApiTarget.TargetId

@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Mock telco REST API (demo only, fake data) for AgentCore Gateway.
+
+# One Lambda (FastAPI + Mangum) behind one REST API.
+# Every method uses AWS_IAM (SigV4) auth, explicit paths (no {proxy+}), no API keys,
+# and an operationId (becomes the MCP tool name in AgentCore Gateway).
+
+Resources:
+  TelcoApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-fn
+      RetentionInDays: 7
+
+  TelcoApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteOwnLogsOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-fn:log-stream:*
+
+  TelcoApiFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: TelcoApiFunctionLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-fn
+      CodeUri: .
+      Handler: app.handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt TelcoApiFunctionRole.Arn
+
+  TelcoApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      StageName: demo
+      EndpointConfiguration:
+        Type: REGIONAL
+      DefinitionBody:
+        openapi: "3.0.1"
+        info:
+          title: Mock Telco API
+          version: "1.0.0"
+        components:
+          securitySchemes:
+            sigv4:
+              type: apiKey
+              name: Authorization
+              in: header
+              x-amazon-apigateway-authtype: awsSigv4
+          schemas:
+            PlanChangeRequest:
+              type: object
+              required: [new_plan_id]
+              properties:
+                new_plan_id:
+                  type: string
+                  description: Target plan ID, e.g. VALUE_50, LITE_150, MAX_1TB
+            TicketRequest:
+              type: object
+              required: [account_id, category, summary, priority]
+              properties:
+                account_id: { type: string, description: "Customer account ID, e.g. ACC-1001" }
+                category:
+                  type: string
+                  enum: [BILLING_DISPUTE, FEE_WAIVER, ACCOUNT_CHANGE, COMPLAINT, OTHER]
+                summary: { type: string, description: Short description of the issue }
+                priority:
+                  type: string
+                  enum: [LOW, MEDIUM, HIGH]
+        security:
+          - sigv4: []
+        paths:
+          /plans:
+            get:
+              operationId: get_all_plans
+              summary: List all available mobile plans
+              description: Return every mobile plan on offer with price, data, talk time, SMS and contract length.
+              security: [{ sigv4: [] }]
+              responses: { "200": { description: List of plans } }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TelcoApiFunction.Arn}/invocations
+          /accounts/{account_id}/plan:
+            get:
+              operationId: get_plan
+              summary: Get a customer's current plan and usage
+              description: Return the customer's current plan details, data used this month and contract end date.
+              security: [{ sigv4: [] }]
+              parameters:
+                - { name: account_id, in: path, required: true, schema: { type: string }, description: "Customer account ID, e.g. ACC-1001" }
+              responses: { "200": { description: Current plan }, "404": { description: Account not found } }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TelcoApiFunction.Arn}/invocations
+          /accounts/{account_id}/bills:
+            get:
+              operationId: get_bill
+              summary: Get a customer's bill
+              description: Return one bill with line items, total, due date and status (PAID, UNPAID or OVERDUE). Defaults to the latest bill.
+              security: [{ sigv4: [] }]
+              parameters:
+                - { name: account_id, in: path, required: true, schema: { type: string }, description: "Customer account ID, e.g. ACC-1001" }
+                - { name: month, in: query, required: false, schema: { type: string }, description: "Billing month YYYY-MM. Defaults to the latest bill." }
+              responses: { "200": { description: Bill }, "404": { description: Account or bill not found } }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TelcoApiFunction.Arn}/invocations
+          /accounts/{account_id}/plan-change:
+            post:
+              operationId: change_plan
+              summary: Change a customer's mobile plan
+              description: Switch the customer to a new plan from the first day of next month. Requires human approval in the agent.
+              security: [{ sigv4: [] }]
+              parameters:
+                - { name: account_id, in: path, required: true, schema: { type: string }, description: "Customer account ID, e.g. ACC-1001" }
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema: { $ref: "#/components/schemas/PlanChangeRequest" }
+              responses: { "200": { description: Plan changed }, "400": { description: Same or unknown plan }, "404": { description: Account not found } }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TelcoApiFunction.Arn}/invocations
+          /tickets:
+            post:
+              operationId: create_ticket
+              summary: Create a support ticket to hand over to a human team
+              description: Open a ticket for a human team (billing dispute, fee waiver, complaint, etc.) and return its SLA.
+              security: [{ sigv4: [] }]
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema: { $ref: "#/components/schemas/TicketRequest" }
+              responses: { "200": { description: Ticket created }, "404": { description: Account not found } }
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TelcoApiFunction.Arn}/invocations
+
+  # Only this API may invoke the function.
+  TelcoApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TelcoApiFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${TelcoApi}/*
+
+Outputs:
+  RestApiId:
+    Value: !Ref TelcoApi
+  StageName:
+    Value: demo
+  ApiUrl:
+    Value: !Sub https://${TelcoApi}.execute-api.${AWS::Region}.amazonaws.com/demo
+  FunctionName:
+    Value: !Ref TelcoApiFunction

@@ -1,0 +1,93 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stage 1a - foundation. The ECR repository the agent team pushes its image to,
+  and the SSM parameters that form the contract between the two teams.
+  Region: ap-southeast-1.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: telco-support
+  ModelId:
+    Type: String
+    Default: apac.amazon.nova-pro-v1:0
+    Description: Bedrock model the agent uses. Must be an Amazon-owned model in this region.
+  SsmPrefix:
+    Type: String
+    Default: /telco-support
+    Description: Root of the SSM parameter namespace shared with the agent team.
+  TransactionSearchIndexingPercentage:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 100
+    Description: >-
+      Percentage of spans indexed for Transaction Search. 100 for a demo so every
+      evaluated session is present; lower it in production, where the ingested
+      span volume is what costs money.
+
+Resources:
+  # Account-level, and a hard prerequisite for AgentCore evaluation: without it
+  # the agent's spans are never indexed and StartBatchEvaluation fails with
+  # "contains N log event(s) but no span documents ... ensure that transaction
+  # search is enabled". Spans are ingested into CloudWatch Logs and billed per GB,
+  # so IndexingPercentage is kept at 100 only because this demo's volume is tiny.
+  TransactionSearch:
+    Type: AWS::XRay::TransactionSearchConfig
+    Properties:
+      IndexingPercentage: !Ref TransactionSearchIndexingPercentage
+
+  AgentImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}/agent"
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Keep the last 10 images so a rollback target always exists.
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 10 most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # --- Contract: platform writes, agent reads -------------------------------
+  EcrRepositoryUriParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/ecr/repository-uri"
+      Type: String
+      Value: !GetAtt AgentImageRepository.RepositoryUri
+      Description: ECR repository the agent team pushes to.
+
+  ModelIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/model/id"
+      Type: String
+      Value: !Ref ModelId
+      Description: Bedrock model ID the agent should use.
+
+Outputs:
+  RepositoryUri:
+    Description: docker push target.
+    Value: !GetAtt AgentImageRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryUri"
+  RepositoryArn:
+    Value: !GetAtt AgentImageRepository.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryArn"

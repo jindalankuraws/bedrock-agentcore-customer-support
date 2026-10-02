@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CloudWatch dashboard and alarm for the telco customer support agent.
+  Deploy in ap-southeast-1, after the runtime and gateway exist (their ARNs are inputs).
+
+  Every metric name here was read from live CloudWatch in this account with
+  `aws cloudwatch list-metrics`, not from documentation:
+    AWS/Bedrock-AgentCore  Invocations, Latency, Duration, Errors, SystemErrors,
+                           UserErrors, Throttles, Sessions, ActiveSessionCount
+    AWS/Bedrock            Invocations, InvocationLatency, InputTokenCount,
+                           OutputTokenCount, TimeToFirstToken   (dimension ModelId)
+    AWS/Bedrock/Guardrails Invocations, InvocationsIntervened, InvocationLatency,
+                           TextUnitCount (dimensions GuardrailArn, GuardrailVersion,
+                           GuardrailPolicyType, GuardrailContentSource, Operation)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: telco-support
+  RuntimeArn:
+    Type: String
+    Description: AgentCore runtime ARN (agentcore status --json).
+  GatewayArn:
+    Type: String
+    Description: AgentCore gateway ARN - the Resource dimension on gateway metrics.
+  GuardrailArn:
+    Type: String
+    Description: Guardrail ARN from the guardrail stack output.
+  GuardrailVersion:
+    Type: String
+    Description: >-
+      Guardrail version. Required: metrics are emitted with BOTH GuardrailArn and
+      GuardrailVersion dimensions, so a widget keyed on the ARN alone shows nothing.
+  ModelId:
+    Type: String
+    Default: apac.amazon.nova-pro-v1:0
+    Description: ModelId dimension on AWS/Bedrock metrics.
+  AlarmEmail:
+    Type: String
+    Description: Address notified when the tool error rate alarm fires.
+  ToolErrorRateThreshold:
+    Type: Number
+    Default: 5
+    Description: Percent of gateway calls failing before the alarm fires.
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alarms"
+      DisplayName: Telco support agent alarms
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # Tool error rate: share of gateway (MCP tool) calls returning 4xx or 5xx.
+  # This is the signal that a backend API is failing, which a latency alarm misses.
+  # IF(...) guards against divide-by-zero when the demo is idle.
+  ToolErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-tool-error-rate"
+      AlarmDescription: !Sub "More than ${ToolErrorRateThreshold}% of gateway tool calls are failing."
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref ToolErrorRateThreshold
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+      Metrics:
+        - Id: errorRate
+          Label: Tool error rate (%)
+          ReturnData: true
+          Expression: "IF(invocations > 0, ((systemErrors + userErrors) / invocations) * 100, 0)"
+        - Id: invocations
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Bedrock-AgentCore
+              MetricName: Invocations
+              Dimensions:
+                - Name: Resource
+                  Value: !Ref GatewayArn
+            Period: 300
+            Stat: Sum
+        - Id: systemErrors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Bedrock-AgentCore
+              MetricName: SystemErrors
+              Dimensions:
+                - Name: Resource
+                  Value: !Ref GatewayArn
+            Period: 300
+            Stat: Sum
+        - Id: userErrors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Bedrock-AgentCore
+              MetricName: UserErrors
+              Dimensions:
+                - Name: Resource
+                  Value: !Ref GatewayArn
+            Period: 300
+            Stat: Sum
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-agent"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Agent invocations and sessions",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Bedrock-AgentCore", "Invocations", "Resource", "${RuntimeArn}", { "label": "Invocations" } ],
+                  [ ".", "Sessions", ".", ".", { "label": "New sessions" } ],
+                  [ ".", "Throttles", ".", ".", { "label": "Throttles" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "End-to-end latency (ms)",
+                "region": "${AWS::Region}",
+                "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Bedrock-AgentCore", "Latency", "Resource", "${RuntimeArn}", { "stat": "p50", "label": "p50" } ],
+                  [ "...", { "stat": "p90", "label": "p90" } ],
+                  [ "...", { "stat": "p99", "label": "p99" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Model tokens (${ModelId})",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Bedrock", "InputTokenCount", "ModelId", "${ModelId}", { "label": "Input tokens" } ],
+                  [ ".", "OutputTokenCount", ".", ".", { "label": "Output tokens" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Tool calls and tool errors (gateway)",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Bedrock-AgentCore", "Invocations", "Resource", "${GatewayArn}", { "label": "Tool calls" } ],
+                  [ ".", "SystemErrors", ".", ".", { "label": "5xx", "color": "#d62728" } ],
+                  [ ".", "UserErrors", ".", ".", { "label": "4xx", "color": "#ff7f0e" } ],
+                  [ ".", "TargetExecutionTime", ".", ".", { "label": "Backend time (ms)", "stat": "Average", "yAxis": "right" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Guardrail interventions",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Bedrock/Guardrails", "Invocations", "GuardrailArn", "${GuardrailArn}", "GuardrailVersion", "${GuardrailVersion}", { "label": "Guardrail checks" } ],
+                  [ ".", "InvocationsIntervened", ".", ".", ".", ".", { "label": "Blocked or masked", "color": "#d62728" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Agent errors",
+                "region": "${AWS::Region}",
+                "stat": "Sum", "period": 300, "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/Bedrock-AgentCore", "SystemErrors", "Resource", "${RuntimeArn}", { "label": "System (5xx)", "color": "#d62728" } ],
+                  [ ".", "UserErrors", ".", ".", { "label": "User (4xx)", "color": "#ff7f0e" } ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardUrl:
+    Description: Direct link to the dashboard.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-agent"
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic

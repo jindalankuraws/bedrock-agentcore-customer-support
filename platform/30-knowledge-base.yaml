@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bedrock Knowledge Base (S3 Vectors) holding the telco's public policy documents.
+
+  Deploys in the same region as the rest of the stack - ap-southeast-1 by default -
+  so that no data leaves Singapore. The embedding model and the index dimension are
+  parameters, so the variant the published evaluation results were measured on
+  (Titan Text Embeddings V2 in us-east-1) can still be selected unchanged.
+
+  This template is region-agnostic: every ARN is built from AWS::Region.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: telco-support
+    Description: Prefix for resource names.
+  EmbeddingModelId:
+    Type: String
+    Default: cohere.embed-multilingual-v3
+    AllowedValues:
+      - cohere.embed-multilingual-v3     # 1024 dims - available in ap-southeast-1
+      - cohere.embed-english-v3          # 1024 dims - available in ap-southeast-1
+      - amazon.titan-embed-text-v2:0     # 1024 dims - NOT in ap-southeast-1; the tested variant
+    Description: >-
+      Bedrock embedding model, which must be offered in THIS stack's region and
+      supported by Bedrock Knowledge Bases. ap-southeast-1 offers no Amazon
+      embedding model, so the in-region default is Cohere Embed Multilingual v3.
+      Note cohere.embed-v4:0 is deliberately absent: it is offered in the region
+      but is not a supported knowledge base embedding model here.
+  EmbeddingDimensions:
+    Type: Number
+    Default: 1024
+    Description: >-
+      Output dimensions, which must match the model. All three allowed models emit
+      1024: Cohere Embed v3 returns "an array of floats with 1024 elements", and
+      Titan Text Embeddings V2 defaults to 1024 (it also supports 512 and 256).
+      This cannot be changed after the index is created.
+
+Resources:
+  # --- Source documents -----------------------------------------------------
+  PolicyDocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-policy-docs-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  # --- Vector store ---------------------------------------------------------
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    # DependsOn, not !Ref: Ref on a VectorBucket returns its ARN, which is too
+    # long for VectorBucketName (max 63). The name is restated instead.
+    DependsOn: VectorBucket
+    Properties:
+      VectorBucketName: !Sub "${ProjectName}-vectors-${AWS::AccountId}"
+      IndexName: !Sub "${ProjectName}-policy-index"
+      DataType: float32
+      Dimension: !Ref EmbeddingDimensions
+      DistanceMetric: cosine
+      # Bedrock writes the chunk text and document metadata into every vector.
+      # S3 Vectors caps FILTERABLE metadata at 2048 bytes per vector, so these two
+      # must be declared non-filterable or ingestion fails on longer chunks.
+      # Neither is ever used as a query filter. This cannot be changed after creation.
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+          - AMAZON_BEDROCK_METADATA
+
+  # --- Knowledge base service role -----------------------------------------
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-kb-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Policies:
+        - PolicyName: embedding-model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+        - PolicyName: source-documents
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt PolicyDocsBucket.Arn
+                  - !Sub "${PolicyDocsBucket.Arn}/*"
+        - PolicyName: vector-store
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3vectors:GetIndex
+                  - s3vectors:QueryVectors
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:ListVectors
+                  - s3vectors:DeleteVectors
+                Resource:
+                  - !GetAtt VectorBucket.VectorBucketArn
+                  - !GetAtt VectorIndex.IndexArn
+
+  # --- Knowledge base -------------------------------------------------------
+  PolicyKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub "${ProjectName}-policy-kb"
+      Description: Fictional telco policy documents - roaming, fees, plan terms, contract termination.
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: !Ref EmbeddingDimensions
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt VectorIndex.IndexArn
+
+  PolicyDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref PolicyKnowledgeBase
+      Name: policy-docs
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt PolicyDocsBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 300
+            OverlapPercentage: 20
+
+Outputs:
+  KnowledgeBaseId:
+    Description: Set as KB_ID in the runtime envVars.
+    Value: !Ref PolicyKnowledgeBase
+  KnowledgeBaseArn:
+    Description: Scope the runtime's bedrock:Retrieve permission to this ARN.
+    Value: !GetAtt PolicyKnowledgeBase.KnowledgeBaseArn
+  DataSourceId:
+    Description: Pass to start-ingestion-job after uploading the documents.
+    Value: !GetAtt PolicyDataSource.DataSourceId
+  PolicyDocsBucket:
+    Description: Upload kb/*.md here, then start an ingestion job.
+    Value: !Ref PolicyDocsBucket
+  KnowledgeBaseRegion:
+    Description: >-
+      Set as KB_REGION in the runtime envVars. Normally the runtime's own region;
+      it is published explicitly so the agent still works if the knowledge base is
+      deployed elsewhere (see the tested variant in docs/PROJECT_OVERVIEW.md).
+    Value: !Ref AWS::Region
+  EmbeddingModel:
+    Description: The embedding model this knowledge base was built with.
+    Value: !Ref EmbeddingModelId

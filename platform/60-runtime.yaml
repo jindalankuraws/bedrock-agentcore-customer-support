@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Stage 2a - AgentCore Runtime and its endpoint, running the container image the
+  agent team pushed to ECR. Region: ap-southeast-1.
+
+  Every environment variable the agent reads is resolved here from SSM, so the
+  agent image carries no account-specific configuration.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: telco_support
+    Description: >-
+      Runtime names allow letters, digits and underscores only (no hyphens).
+  # These are AWS::SSM::Parameter::Value<String>, not {{resolve:ssm:...}}, on purpose.
+  # A dynamic reference is resolved at deploy time but CloudFormation does not treat a
+  # changed SSM value as a stack diff, so the runtime silently keeps the old value -
+  # which left it pinned to a guardrail version that had been replaced. A typed SSM
+  # parameter is resolved into the stack's parameter set, so a change is a real diff.
+  RuntimeRoleArnParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/iam/runtime-role-arn
+  ModelIdParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/model/id
+  GuardrailIdParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/guardrail/id
+  GuardrailVersionParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/guardrail/version
+  KbIdParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/kb/id
+  KbRegionParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/kb/region
+  GatewayUrlParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /telco-support/gateway/url
+  SsmPrefix:
+    Type: String
+    Default: /telco-support
+  ImageUri:
+    Type: String
+    Description: >-
+      Full ECR image URI including tag or digest, from the agent team's build.
+      Prefer a digest (@sha256:...) so a redeploy is reproducible.
+  EndpointName:
+    Type: String
+    Default: live
+    Description: Runtime endpoint name. Traffic is sent to this endpoint, not to the runtime directly.
+
+Resources:
+  AgentRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: !Ref ProjectName
+      Description: Telco customer support agent (Strands).
+      RoleArn: !Ref RuntimeRoleArnParam
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ImageUri
+      NetworkConfiguration:
+        NetworkMode: PUBLIC          # VPC mode is the production path - see docs/OWNERSHIP.md
+      ProtocolConfiguration: HTTP
+      EnvironmentVariables:
+        MODEL_ID: !Ref ModelIdParam
+        GUARDRAIL_ID: !Ref GuardrailIdParam
+        GUARDRAIL_VERSION: !Ref GuardrailVersionParam
+        KB_ID: !Ref KbIdParam
+        KB_REGION: !Ref KbRegionParam
+        AGENTCORE_GATEWAY_TELCO_GATEWAY_URL: !Ref GatewayUrlParam
+
+  # Named endpoint so a new runtime version can be built and tested before
+  # traffic moves. Promotion = point this endpoint at the new version.
+  AgentRuntimeEndpoint:
+    Type: AWS::BedrockAgentCore::RuntimeEndpoint
+    Properties:
+      AgentRuntimeId: !GetAtt AgentRuntime.AgentRuntimeId
+      Name: !Ref EndpointName
+      AgentRuntimeVersion: !GetAtt AgentRuntime.AgentRuntimeVersion
+      Description: Endpoint serving live demo traffic.
+
+  RuntimeArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/runtime/arn"
+      Type: String
+      Value: !GetAtt AgentRuntime.AgentRuntimeArn
+
+  RuntimeEndpointNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "${SsmPrefix}/runtime/endpoint"
+      Type: String
+      Value: !Ref EndpointName
+
+Outputs:
+  RuntimeArn:
+    Value: !GetAtt AgentRuntime.AgentRuntimeArn
+    Export:
+      Name: !Sub "${AWS::StackName}-RuntimeArn"
+  RuntimeId:
+    Value: !GetAtt AgentRuntime.AgentRuntimeId
+  RuntimeVersion:
+    Description: Version the endpoint currently serves.
+    Value: !GetAtt AgentRuntime.AgentRuntimeVersion
+  EndpointArn:
+    Value: !GetAtt AgentRuntimeEndpoint.AgentRuntimeEndpointArn
+  LogGroup:
+    Description: Pass to the evaluation runner as --log-group.
+    Value: !Sub
+      - "/aws/bedrock-agentcore/runtimes/${RuntimeId}-${EndpointName}"
+      - RuntimeId: !GetAtt AgentRuntime.AgentRuntimeId
+  ServiceName:
+    Description: Pass to the evaluation runner as --service-name.
+    Value: !Sub
+      - "${RuntimeId}.${EndpointName}"
+      - RuntimeId: !GetAtt AgentRuntime.AgentRuntimeId

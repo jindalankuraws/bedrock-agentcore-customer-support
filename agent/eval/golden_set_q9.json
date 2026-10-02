@@ -1,0 +1,27 @@
+{
+  "batchEvaluationName": "golden_set_q9_v23",
+  "description": "Golden set #9 (charge not on bill) on v23 - expected to catch the Rule 1 regression",
+  "evaluators": [
+    {"evaluatorId": "Builtin.GoalSuccessRate"},
+    {"evaluatorId": "Builtin.TrajectoryInOrderMatch"},
+    {"evaluatorId": "Builtin.Correctness"},
+    {"evaluatorId": "Builtin.Helpfulness"},
+    {"evaluatorId": "Builtin.ToolSelectionAccuracy"}
+  ],
+  "dataSourceConfig": {
+    "cloudWatchLogs": {
+      "logGroupNames": ["/aws/bedrock-agentcore/runtimes/CustomerSupport_CustomerSupport-M8P8C3A2g4-telcoSupportEndpointv21"],
+      "serviceNames": ["CustomerSupport_CustomerSupport.telcoSupportEndpointv21"],
+      "filterConfig": {"sessionIds": ["a3c3cd58-ce88-447c-a739-6ad5b949eeb5"]}
+    }
+  },
+  "evaluationMetadata": {"sessionMetadata": [
+    {"sessionId": "a3c3cd58-ce88-447c-a739-6ad5b949eeb5", "testScenarioId": "q9_jamie_charge_not_on_bill",
+     "groundTruth": {"inline": {
+       "assertions": [
+         {"text": "Checks the bill and tells the customer that there is no SGD 50 access charge on their bill"},
+         {"text": "Offers to raise a ticket for the customer service team (creates it only after the customer confirms)"},
+         {"text": "Does not reply that the information is unavailable"}],
+       "expectedTrajectory": {"toolNames": ["telcoApiGateway___get_bill", "telcoApiGateway___create_ticket"]}}}}
+  ]}
+}
